@@ -2,195 +2,252 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository state: specification only
+# XAUUSD BOT — ENGINEERING RULES
 
-This repository currently contains **no source code**. It holds one design document:
+`README.md` (spec §1–§46) is the authority. Cite sections (e.g. "spec §14") when explaining a
+decision, and read the relevant section before changing behaviour it covers. Where this file and
+the spec disagree, the disagreement is called out explicitly below — do not resolve it silently.
 
-- `README.md`
-- `PAPER_AGENT_SPEC.md`
+## Critical invariants
 
-These two files are **byte-identical copies** of the same 1749-line specification. There is no
-package manifest, no build system, no test suite, no CI, and no dependency lockfile.
+Enforcement requirements, not conventions. Spec §42 forbids removing any of them to increase
+trade count. If a change would relax one, **stop and raise it** rather than implementing it.
 
-Two consequences:
+1. `MAX_CONCURRENT_POSITIONS = 1`. Enforced in the execution layer. If a position exists, a new
+   order is rejected outright — never reason about whether the two are correlated.
+2. Every position must have an SL. Not protected until the **broker confirms** it (spec §20).
+3. Never increase risk because of ambiguity.
+4. Never silently guess financial instructions.
+5. Entry confidence must be `>= 0.95`.
+6. Image parser disagreement means rejection. Never average, never prefer the "more reasonable"
+   parse, never add a third tiebreaker heuristic (spec §11).
+7. Daily kill switch requires manual re-arm. Survives restart, crash, reconnect, deploy — and
+   **does not clear at midnight**.
+8. Broker state is authoritative for live positions. The local DB is a cache that can be stale
+   or wrong, especially after a crash.
+9. Never bypass the policy engine.
+10. Never modify execution safety rules without explicit approval.
 
-1. **Do not hunt for an implementation** — there isn't one. The spec describes a system to be
-   built, not a system that exists. Descriptions in it are requirements, not documentation of
-   working behavior.
-2. **Any spec edit must be applied to both files**, or they silently drift. Verify with
-   `diff README.md PAPER_AGENT_SPEC.md` before committing. (If the user wants one to become the
-   canonical copy and the other a pointer, that is a reasonable change to propose — but make it
-   deliberately, not as a side effect.)
+## Never
 
-### Commands
+- Never enter without SL.
+- Never open a second position.
+- Never retry an unknown broker order blindly — resolve it against broker truth.
+- Never treat temporary +70 pip movement as a successful 70-pip trade.
+- Never use AI judgment to override deterministic safety rules.
+- Never post status messages into the channel the bot reads signals from (feedback loop: the
+  bot's own message quoting a price can be re-ingested as a signal). Separate chat, **and** an
+  ingestion filter on our own sender id.
+- Never let untrusted message content reach a model outside a delimited, length-bounded data
+  block. Signals are attacker-controllable text and images from a channel we do not control.
 
-There are none to document yet. When the first code lands, establish the run/test/lint commands
-in the same change and record them here. Do **not** invent or guess commands for tooling that
-isn't in the repo.
+## Development rules
 
-The spec's code samples are Python, and it names MT5 as the broker, Telethon for Telegram history
-backfill, and YAML for config — so a Python project is implied. Treat that as the spec's
-expectation, not a decision already made; confirm the stack with the user before scaffolding.
+- Inspect before modifying.
+- Prefer small commits.
+- Write tests with every safety-critical feature.
+- Never delete existing functionality without proving it is obsolete.
+- Never fabricate broker/API behaviour. When MT5 or Telegram behaviour is unclear, write the
+  adapter against the interface, stub it, and leave a `# VERIFY:` comment naming the doc page a
+  human must check. Do not guess endpoint names, parameter names, retcode numbers, or response
+  shapes.
+- Use timezone-aware datetime. **Store UTC**; one `clock.now_utc()` is the only time source;
+  `now_ist()` derives from it for session logic only. Tests inject a fake clock. A lint test
+  asserts no other module imports `datetime.now`.
+- All money/risk calculations must be deterministic.
+- All broker price calculations must go through centralized utilities (`PriceUtils`).
+- Never hard-code pip/point assumptions throughout the codebase. No module outside `price.py`
+  may contain a numeric price constant.
+- Ledger before broker, always: an `intents` row with its idempotency key is committed **before**
+  any request leaves the process. This ordering is what makes crash recovery decidable.
+- Every rejection carries a structured reason code from spec §26 — never a bare
+  "signal rejected". Every decision must be reconstructible afterwards from the `decisions`
+  table alone (spec §27).
 
-## What the system is
+## Trading rules
 
-An autonomous XAUUSD (gold) trading system: it ingests signals from Telegram (text and
-screenshots), extracts structured trade instructions, validates them, correlates follow-up
-messages to open positions, applies risk policy, and executes via a broker API — with no human
-in the approval path.
+```text
+Morning entries          05:30–09:00 IST
+Evening entries          from 20:00 IST — end time is REQUIRED config, no default
+Max concurrent positions 1
+Order rate limit         1 new ENTRY / 60s (modifications, closes, partial closes NOT throttled)
+```
 
-The governing principle, from which nearly every rule in the spec derives:
+**Three consecutive losses** → disable morning entries. A win resets the counter.
 
-> When uncertainty exists, prefer missing a trade over entering the wrong trade, and prefer
-> reducing risk over increasing risk.
+**Two completed winning trades >= 70 pips** → permit one evening trade, subject to all other
+rules. Evening SL/risk maximum: **40 pips**.
 
-A missed trade is the intended behavior, not a bug. Expect to write code that rejects far more
-than it accepts.
+A "successful 70+ pip trade" is a *realized* winner with validated movement >= 70 pips.
+Touching +70 then losing does not count. Reaching TP1 alone does not count (spec §6).
+
+### TP ladder — driven by TP count, not distance
+
+```text
+1 TP     → single full exit, no partial ladder
+2 TPs    → TP1 close 50%          → TP2 close remaining 50%
+3 TPs    → TP1 close 50%          → TP2 close 50% OF REMAINING (25% of original)
+                                  → TP3 close remainder
+4+ TPs   → REJECT (TP_COUNT_UNSUPPORTED) — do not guess a ladder
+```
+
+TP1 distance comes from the signal (30 / 35 / 60 / 75+ pips, market dependent). It is **not** a
+configured constant. TP2 is 50% of *remaining* volume, never another 50% of the original.
+
+> **OPEN CONFLICT — do not resolve without asking.** Spec §16 keys the staged exit on
+> *distance* (`target >= 170 pips`). The rule above keys it on *TP count*, per explicit
+> instruction. The two disagree, and a 2-TP signal with a 200-pip TP2 has no TP3 to stage on.
+> The TP-count rule is authoritative; the 170-pip threshold is retained only as a **logged
+> label** for analytics. Confirm before changing either.
+
+### After TP1 — protective SL
+
+Apply a protected SL using broker-aware spread/slippage calculation. Account for **which side of
+the spread closes the position** — do not mirror one formula across BUY and SELL (spec §14).
+
+The computed level can be unplaceable: with TP1 as tight as 30 pips and spread blown out to 30
+pips at rollover, `entry + spread + slippage + 15` lands above the current bid and the broker
+rejects it. Deterministic fallback ladder, each rung less protective than the last, never more
+risky:
+
+```text
+1. protective level   entry ± (spread + slippage + 15 pips)
+2. breakeven ± broker min_stop_distance
+3. close the remaining volume entirely
+   → log which rung fired, notify; never silently skip
+```
+
+### Position reporting
+
+While a position is open, post a status update every **3 minutes**, plus an event message on
+every transition: `SL_HIT`, `BE_MOVED`, `TP1_FILLED`, `TP2_FILLED`, `FINAL_TP`, and every
+rejection with the full broker retcode, constant name and message. Delivered via a DB outbox
+drained by a separate loop — a Telegram outage must never block or delay execution.
+
+## Order state machine
+
+`UNKNOWN` is an **order-request** outcome, not a trade outcome. SL/BE/TP describe a position that
+definitely exists; `UNKNOWN` means we do not know whether one exists at all (request sent, no
+reply). Treating `submit()` as a boolean, or defaulting `UNKNOWN` to `REJECTED` and retrying, is
+how you end up with two positions and double risk.
+
+```text
+PENDING → SUBMITTED → ACKED → PARTIAL → FILLED
+                    ↘ REJECTED / CANCELLED
+                    ↘ UNKNOWN  ← MUST reconcile against broker truth, never blind retry
+```
+
+## Reconciliation
+
+Two paths, both reading broker truth rather than the local DB:
+
+- **Startup** (spec §36): connect DB → connect broker → fetch positions → fetch recent
+  orders/deals → reconcile → detect orphans → restore daily state → restore kill switch →
+  verify symbol config → *only then* enable signal processing. Trading stays disabled throughout.
+- **Sweeper** (spec §22, ~60s). Spec §22 describes only one of four cases; handle all four:
+
+| At broker | In DB | Meaning | Action |
+|---|---|---|---|
+| exists | exists, volume matches | healthy | none |
+| exists | absent | orphan | adopt if our `magic`; else alert + policy close |
+| absent | open | phantom (closed at broker, DB stale) | find closing deal, mark closed, fix daily state |
+| exists | exists, volume differs | partial-close desync | broker volume is truth; repair DB, re-verify SL |
+
+The phantom case is a *correctness* issue beyond safety: a win the DB never learned about leaves
+`consecutive_losses` and `successful_70pip_trades` wrong, silently corrupting the rules above.
+
+## State persistence
+
+`DailyState` (date_ist, morning/evening trade counts, wins, losses, `consecutive_losses`,
+`successful_70pip_trades`, `morning_disabled`, `evening_consumed`) must survive restarts — never
+RAM-only (spec §5). A row whose `date_ist` is not today is never loaded as today's state.
+
+The **kill switch lives outside `DailyState`**, in a singleton `bot_state` table. Spec §5 places
+it inside date-keyed `DailyState`, which would re-arm it at midnight and violate §21. This file
+overrides the spec here.
 
 ## Pipeline architecture
 
-The spec mandates these as **separate layers**, each independently testable (spec §37, §41):
+Separate layers, each independently testable (spec §37, §41):
 
 ```text
-Telegram sources → Archiver → Parser (text + vision) → Normalizer → Validator
+Telegram → Archiver → Parser (VLM + OCR) → Normalizer → Validator
   → Correlator → Policy Engine → Risk Engine → Execution Engine → Broker/MT5
 ```
 
-Layer boundaries that must not be crossed (spec §44):
+Boundaries that must not be crossed (spec §44): no risk logic in the parser; no parser logic in
+execution; nothing bypasses the policy engine; not one large Python file. Enforce mechanically —
+one test asserts only `parse/vlm.py` imports the Anthropic SDK, and only `broker/mt5.py` imports
+`MetaTrader5`. Comments do not hold.
 
-- No risk logic in the parser.
-- No parser logic in the execution layer.
-- Nothing bypasses the Policy Engine.
-- Not one large Python file.
+Four rejection concerns, deliberately kept apart (spec §41) — conflating them is a design error:
 
-Four distinct rejection concerns, deliberately kept apart (spec §41) — conflating them is a
-design error, not a simplification:
+| Concern | Question | Layer |
+|---|---|---|
+| Signal validity | Is this a well-formed BUY/SELL setup? | validator |
+| Trading eligibility | Is the bot allowed to trade right now? | policy |
+| Risk eligibility | Is this trade within risk limits? | risk |
+| Execution validity | Can the broker safely execute it? | execution |
 
-| Concern | Question |
-| --- | --- |
-| Signal validity | Is this a well-formed BUY/SELL setup? |
-| Trading eligibility | Is the bot allowed to trade right now? |
-| Risk eligibility | Is this trade within risk limits? |
-| Execution validity | Can the broker safely execute it? |
+A valid signal rejected because the morning session is disabled is **correct behaviour**, not a
+bug. Expect code that rejects far more than it accepts.
 
-A perfectly valid signal rejected because the morning session is disabled is correct behavior.
-
-Every signal walks a lifecycle (spec §25): `RAW → PARSED → NORMALIZED → VALIDATED → CORRELATED
-→ POLICY_CHECKED → EXECUTION_APPROVED → SUBMITTED → BROKER_CONFIRMED → MANAGED → CLOSED`. Any
-stage may emit `REJECTED` — always with a structured reason code from the spec's enumerated list
-(spec §26), never a bare "signal rejected".
-
-## Hard invariants — never weaken these
-
-These are enforcement requirements, not conventions. The spec explicitly forbids removing them
-to increase trade count (spec §42). If a change would relax one, stop and raise it with the user
-rather than implementing it.
-
-- **`MAX_CONCURRENT_POSITIONS = 1`.** Enforced in the execution layer. If a position exists, a
-  new order is rejected outright — do not reason about whether the two are correlated. This
-  invariant is also what makes single-position correlation fallback safe (spec §3.1, §18).
-- **Entry confidence < 0.95 → skip.** Entry decisions are asymmetric: a missed entry costs
-  nothing (spec §9).
-- **Image double-parse consensus.** Every image is parsed twice with independent instructions.
-  On disagreement in any critical field (direction, entry, SL, TP, TP1, TP2, symbol): **reject**.
-  Never average the numbers, never pick the "more reasonable" parse, never add a third tiebreaker
-  heuristic (spec §11).
-- **No naked orders.** Every position is submitted with a valid SL. A position is not considered
-  protected until the broker confirms the SL (spec §20).
-- **Daily loss kill switch** persists across restart, crash, reconnect, and deploy, and requires
-  **manual re-arm**. A process restart must never re-enable trading (spec §21).
-- **Order rate limit: 1 new order / 60 seconds**, as a runaway guard independent of the parser
-  (spec §24).
-- **Orphan sweeper** every ~60s: reconcile broker positions against the internal DB; a broker
-  position with no internal record is flagged and handled. No unknown position is left unmanaged
-  (spec §22).
-- **Deduplication** on `source_message_id` + `content_hash` + dedupe window, covering reposts,
-  edits, network/API retries, and restarts (spec §23).
-
-## Session and daily-state rules
-
-All times are **`Asia/Kolkata` (IST)** with a timezone-aware clock. Naive local timestamps are a
-bug (spec §4).
-
-- Morning entries: `05:30–09:00 IST` only. Outside the window, existing positions are still
-  managed; session close never force-closes a position unless a separate risk policy says so.
-- Evening session opens `20:00 IST`, **max 1 new trade**, closing time configurable. "After 8 PM"
-  does not mean all-night trading.
-- Evening conditional trade requires `successful_70pip_trades_today >= 2`, and caps SL/risk at
-  **40 pips**. Passing this gate does not make the signal valid — it still runs every other check
-  (spec §7).
-- `consecutive_losing_trades >= 3` disables **morning** new entries. The evening cap stays at 1 —
-  evening is not an unlimited recovery window (spec §8).
-- A "successful 70+ pip trade" means a *realized* winner with validated movement ≥ 70 pips.
-  Touching +70 and then losing does not count; reaching TP1 alone does not count (spec §6).
-
-`DailyState` (date, morning/evening trade counts, win/loss counts, `consecutive_losses`,
-`successful_70pip_trades`, `morning_disabled`, `evening_trade_consumed`, `daily_kill_switch`)
-must survive process restarts — never RAM-only (spec §5).
-
-Startup order is fixed, and **trading stays disabled throughout reconciliation**: connect DB →
-connect broker → fetch open positions → fetch recent orders/deals → reconcile → detect orphans →
-restore daily state → restore kill switch → verify symbol config → *only then* enable signal
-processing (spec §36).
-
-## Broker and price mechanics
-
-- **Never assume `1 pip == 1 point`.** Verify against the broker's XAUUSD specification (spec §13).
-- All pip/point/spread/slippage/stop-distance math lives in **one central price utility module**.
-  Broker-specific pip assumptions must not be scattered through the codebase.
-- Position sizing and partial closes must normalize to broker `min_volume` / `max_volume` /
-  `volume_step`. If a partial close can't execute safely, use a deterministic fallback — never
-  silently over-close and never silently increase risk (spec §17).
-- Protective SL after TP1 is entry ± (slippage + spread + 15 pips), but the implementation must
-  account for **which side of the spread closes the position** rather than mirroring one formula
-  across BUY and SELL. The resulting SL has to actually lock in the intended protection (spec §14).
-- TP management: TP1 closes 50%, then SL moves to the protective level. For large targets
-  (≥ 170 pips), TP2 closes **50% of the remaining volume**, not another 50% of the original
-  (spec §15, §16).
+`policy` and `risk` are pure functions over `(signal, daily_state, clock, config)` — no I/O, no
+broker, no model. That is what makes spec §39's exhaustive rule testing cheap.
 
 ## Correlating follow-up messages
 
-Follow-ups like "move SL to BE", "close the sell", "book half" resolve deterministically by
-priority: reply-to message ID (1.0) → unique price match within 50 pips (0.90) → unique direction
-match (0.85) → single-open-position fallback (0.80) → otherwise no match (spec §18).
+Priority (spec §18): reply-to id (1.0) → unique price match within 50 pips (0.90) → unique
+direction match (0.85) → single-open-position fallback (0.80) → no match.
 
-Ambiguity is resolved **by the direction of risk**, not by confidence alone (spec §19):
+Resolved by **direction of risk**, not confidence alone (spec §19):
 
-- Protective/risk-reducing action (move to BE, close, partial close) + exactly one open position
-  + unambiguous action → apply it.
-- Risk-increasing action (widen SL, add position, increase size, remove SL, move SL away from
-  price) under any uncertainty → **ignore**. Never guess.
+- Risk-**reducing** (move to BE, close, partial close) at `>= 0.80` with one open position and an
+  unambiguous action → apply.
+- Risk-**increasing** (widen SL, add position, increase size, remove SL, move SL away from
+  price) → requires `reply_to_id` (1.0); otherwise **ignore**. Never guess.
 
 ## Build order
 
-The spec prescribes a strict sequence (spec §28, §43) — the archiver is first, and full execution
-is explicitly deferred:
+`P0` Foundations + Archiver → `P1` Parser + measured accuracy → `P2` Decision engine in shadow
+mode → `P3` Execution + position management (demo). Live is a go/no-go decision on P3 evidence,
+not a phase. Do not develop the parser against invented examples — build the real corpus first
+(spec §28).
 
-`P0` Archiver (Telegram ingestion, history backfill, raw + image storage, reply graph, dedupe) →
-`P1` hand-labeled dataset + parser + evaluation → `P2` Correlator → `P3` Policy Engine →
-`P4` Risk Engine → `P5` Shadow execution (`WOULD ENTER` / `WOULD MODIFY` / `WOULD CLOSE`, no
-orders sent) → `P6` Demo account, minimum 2 weeks → `P7` Live at minimum position size.
+**Live gate** (spec §31), a minimum bar not a target: zero direction errors across 100
+consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
 
-Do not develop the parser against invented examples — build the real corpus first.
+## Unresolved — ask, do not invent
 
-**Live gate** (spec §31), a minimum bar rather than a target: zero direction errors across 100
-consecutive validated signals, **and** ≥ 98% field-level accuracy on entry/SL. Failing the gate
-means full auto stays off.
+1. **XAUUSD pip definition.** Spec §13 forbids assuming `1 pip == 1 point`, then §6/§7/§14/§16
+   state every limit in pips without defining one. Depending on convention a pip is `$0.01`,
+   `$0.10` or `$1.00` — so "70 pips" spans `$0.70` to `$70`. **No threshold is codeable until
+   this comes from the broker's contract spec.** Do not pick a value.
+2. **Deployment platform.** The official `MetaTrader5` Python package is **Windows only** (IPC to
+   a running terminal; no Linux build). Unresolved between Windows VPS, a split MQL5-EA + Python
+   design, or a broker REST API. Blocks P3, not P0.
+3. **Evening after three losses.** Spec §8 sends you to the evening session after 3 consecutive
+   losses, but the evening gate requires 2 × 70-pip wins — which 3 losses nearly rules out, so
+   §8's remedy is usually unreachable. Intent unconfirmed.
+4. **Entry proximity.** Spec §12's `abs(entry − mid)/mid < 0.005` is 0.5% ≈ `$13.25` at gold
+   2650 — 3× to 30× the evening 40-pip cap, so it will not catch a stale signal. Replaced by a
+   configurable `max_entry_distance_pips`; the value is unchosen.
+5. **Confidence semantics.** §9 gates at `< 0.95` but §11's double-parse is binary, and a
+   model's self-reported confidence would contradict §44. Current rule: confidence is *computed*
+   — full agreement plus all deterministic validation passing = 1.0, any disagreement = 0.0. A
+   graded score would have to come from measured per-field accuracy, never from the model.
 
-## Working in this repo
+## Repository state
 
-- The spec is the authority. Its section numbers are stable — cite them (e.g. "spec §14") when
-  explaining a decision, and read the relevant section before changing behavior it covers.
-- Safety-critical constants belong in one central config (the spec sketches a YAML layout in
-  §38). Do not duplicate thresholds across modules.
-- Every decision must be reconstructible after the fact: log the raw signal, both parser results
-  and confidences, validation outcome, market price and spread, computed SL distance and risk,
-  daily state, session, policy and correlation results, execution result, broker ticket, and
-  position state. The logs must answer "why did the bot take this trade?" and "why was this
-  signal rejected?" without guesswork (spec §27).
-- Every safety rule needs a test. The spec enumerates required coverage per layer in §39,
-  including session boundary cases (05:29/05:30, 08:59/09:00, 19:59/20:00) and recovery cases
-  (restart with an open position, orphan position, missing DB record, broker timeout, duplicate
-  execution request).
-- Prefer deterministic logic over model judgment, and never increase risk because a model
-  "thinks" it is probably correct (spec §44).
+No source code yet. `README.md` is the spec; `PAPER_AGENT_SPEC.md` is an intentionally frozen
+reference copy of it — `README.md` may diverge in future, and that divergence is expected, not
+drift to be "fixed". Do not reconcile them.
+
+There are no build/lint/test commands yet. When the first code lands, establish them in the same
+change and record them here. Do **not** invent commands for tooling that is not in the repo.
+
+> Note on history: commit `8a505a2` ("Update print statement from 'Hello' to 'Goodbye'") actually
+> overwrote `PAPER_AGENT_SPEC.md`, which previously held a different 968-line document —
+> a "Paper-Trading Research Agent" build spec. It is recoverable via
+> `git cat-file blob b4e66502`. Commit messages in this repo do not reliably describe their
+> changes; verify against diffs rather than trusting subjects.

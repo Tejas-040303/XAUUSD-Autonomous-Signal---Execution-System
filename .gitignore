@@ -1,0 +1,127 @@
+# ---------------------------------------------------------------------------
+# CREDENTIALS — never commit. This repository is PUBLIC.
+#
+# A Telethon .session file is a post-authentication BEARER CREDENTIAL: it
+# grants full API access to the Telegram account (read every chat, send as
+# that account) and bypasses both the account password and 2FA. It is revoked
+# only by explicitly terminating the session from another device.
+#
+# An MT5 master password grants full trading control of the account from any
+# terminal, anywhere. MT5 has no scoped API keys.
+#
+# A push to a public repo cannot be undone: unreachable git objects stay
+# retrievable by SHA, forks make them permanent, and the public Events API
+# archives the push. Secret-scraping bots index public pushes within minutes.
+# If one of these is ever committed, rotate the credential — do not just
+# delete the file.
+# ---------------------------------------------------------------------------
+
+# Telegram (Telethon / Pyrogram)
+*.session
+*.session-journal
+*.session_string
+anon.session*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+secrets.yaml
+secrets.yml
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local / real configuration. Commit only sanitised examples.
+config/local.yaml
+config/local.yml
+config/*.local.yaml
+config/secrets.yaml
+mt5_credentials*
+terminal.ini
+
+# ---------------------------------------------------------------------------
+# DATA — the trading ledger and the message archive.
+#
+# The archive holds third-party message content and images with no retention
+# basis, and it grows without bound. Keep both out of the repo, and keep the
+# archive on a different volume from the ledger so a full archive disk cannot
+# stop the ledger from recording losses (which would stop the kill switch from
+# ever tripping).
+# ---------------------------------------------------------------------------
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+media/
+archive/
+corpus/
+*.jsonl
+
+# Model / eval outputs
+eval_runs/
+.prompt_cache/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Testing / tooling caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/

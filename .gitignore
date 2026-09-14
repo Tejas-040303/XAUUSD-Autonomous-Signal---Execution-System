@@ -50,16 +50,24 @@ terminal.ini
 # archive on a different volume from the ledger so a full archive disk cannot
 # stop the ledger from recording losses (which would stop the kill switch from
 # ever tripping).
+#
+# These directory patterns are ANCHORED to the repository root with a leading
+# slash. Unanchored, `archive/` matches a directory of that name at ANY depth —
+# which silently excluded the whole `xauusd/archive/` source package, and would
+# have done the same to `xauusd/media/`. A gitignore rule that hides source is
+# far worse than one that misses a data file: `git status` shows nothing, so the
+# omission survives review and only surfaces as an ImportError on another
+# machine.
 # ---------------------------------------------------------------------------
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
-media/
-archive/
-corpus/
+/media/
+/archive/
+/corpus/
 *.jsonl
 
 # Model / eval outputs

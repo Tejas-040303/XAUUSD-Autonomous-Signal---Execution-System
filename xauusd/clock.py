@@ -140,3 +140,42 @@ def ist_date(moment: datetime) -> date:
 def _require_aware(moment: datetime) -> None:
     if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
         raise ValueError(f"naive datetime is a bug (spec §4): {moment!r}")
+
+
+# -- storage representation ---------------------------------------------------
+# One textual form for every stored timestamp, defined here because "store UTC"
+# is a time concern and splitting it across the modules that happen to write
+# rows is how two formats end up in one column.
+
+
+def iso_utc(moment: datetime) -> str:
+    """The canonical stored form: ``2026-09-14T05:45:00.123456Z``.
+
+    Fixed-width to the second, always UTC, always a literal ``Z``. Three
+    properties the schema relies on:
+
+    - **Lexicographic order equals chronological order**, so ``ORDER BY`` and
+      ``BETWEEN`` work on the text without a conversion function.
+    - **Unambiguous.** Python's ``isoformat()`` renders UTC as ``+00:00``, and a
+      column holding both spellings silently breaks range comparisons on the
+      boundary. Every ``CHECK`` constraint in the schema tests for the ``Z``.
+    - **Naive input is impossible**, because the conversion rejects it rather
+      than assuming the timestamp meant UTC.
+    """
+    return to_utc(moment).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_iso_utc(text: str) -> datetime:
+    """Inverse of ``iso_utc``. Returns an aware UTC datetime.
+
+    Accepts the ``+00:00`` spelling too, so rows written before this helper
+    existed still read back, but never emits it.
+    """
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    parsed = datetime.fromisoformat(candidate)
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"stored timestamp {text!r} has no timezone. A naive value in a "
+            "timestamp column means something bypassed iso_utc() on the way in."
+        )
+    return to_utc(parsed)

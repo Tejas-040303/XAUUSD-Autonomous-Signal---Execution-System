@@ -66,6 +66,22 @@ VALID = {
         "max_image_pixels": 40000000,
         "max_signal_age_seconds": "300",
         "dedupe_window_seconds": 86400,
+        "session_path": "data/telegram.session",
+    },
+    "archive": {
+        "media_root": "data/media",
+        "backfill_batch_size": 200,
+        "backfill_oldest_message_id": 1,
+        "backfill_max_windows_per_run": 50,
+        "media_poll_seconds": "2",
+        "max_download_attempts": 4,
+        "size_mismatch_tolerance": "0.25",
+    },
+    "notify": {
+        "lease_seconds": "30",
+        "max_attempts": 8,
+        "drain_interval_seconds": "2",
+        "claim_batch": 10,
     },
     "database": {
         "trading_path": "data/trading.db",
@@ -238,3 +254,75 @@ def test_pip_size_must_be_whole_points(tmp_path: Path):
     data["symbol"] = sym
     with pytest.raises(ConfigError, match="whole multiple of point"):
         load_config(write(tmp_path, data))
+
+
+# ---------------------------------------------------------------------------
+# Fail closed, exhaustively
+# ---------------------------------------------------------------------------
+# The curated list above documents which values matter and why. This pair
+# derives the same rule from the schema itself, so a section added later is
+# covered without anyone remembering to extend a list — which is exactly how a
+# "required" safety value acquires a default nobody notices.
+
+
+def _leaf_keys() -> list[tuple[str, str]]:
+    return [
+        (section, key)
+        for section, body in VALID.items()
+        if isinstance(body, dict)
+        for key in body
+    ]
+
+
+@pytest.mark.parametrize(
+    ("section", "key"), _leaf_keys(), ids=[f"{s}.{k}" for s, k in _leaf_keys()]
+)
+def test_no_config_key_has_a_usable_default(tmp_path: Path, section: str, key: str):
+    """Removing ANY key must fail validation.
+
+    A default is how a limit you believed you had turns out never to have
+    existed. The one tolerated exception would be a value with no safety
+    meaning, and there is currently none — if this test ever needs an
+    exemption, the field should be justified in the schema first.
+    """
+    import copy
+
+    broken = copy.deepcopy(VALID)
+    del broken[section][key]
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, broken))
+
+
+@pytest.mark.parametrize("section", sorted(VALID))
+def test_a_missing_whole_section_is_an_error(tmp_path: Path, section: str):
+    import copy
+
+    broken = copy.deepcopy(VALID)
+    del broken[section]
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, broken))
+
+
+def test_unknown_keys_are_rejected(tmp_path: Path):
+    """`extra="forbid"`: a typo must fail loudly rather than leave the real
+    field on its default."""
+    import copy
+
+    typo = copy.deepcopy(VALID)
+    typo["risk"]["max_sl_pip"] = "70"
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, typo))
+
+
+def test_a_database_inside_the_media_tree_is_rejected(tmp_path: Path):
+    """The media tree grows without bound and holds untrusted third-party
+    bytes. A database file sharing its disk fate defeats the two-database
+    split, whose whole purpose is that a full archive disk must not stop the
+    ledger from recording losses."""
+    import copy
+
+    nested = copy.deepcopy(VALID)
+    nested["archive"]["media_root"] = "data/media"
+    nested["database"]["trading_path"] = "data/media/trading.db"
+    with pytest.raises(ConfigError, match="media_root"):
+        load_config(write(tmp_path, nested))

@@ -73,12 +73,11 @@ def _classify(entity) -> tuple[str, str]:
 
     `kind` matches the config vocabulary: "channel" | "group" | other.
 
-    # VERIFY: telethon.tl.types.Channel carries .broadcast and .megagroup flags,
-    # and Chat is the legacy (pre-supergroup) group type. Confirm against
-    # https://docs.telethon.dev/en/stable/quick-references/faq.html#how-can-i-get-the-chat-id
-    # if a chat here classifies unexpectedly. Telethon could not be installed in
-    # the environment this file was written in, so these attribute names are
-    # from documentation rather than verified by import.
+    Verified against telethon 1.45: `types.Channel` declares both `broadcast`
+    and `megagroup` as constructor fields, and `types.Chat` is the legacy
+    pre-supergroup group type. Both flags are read with `getattr` defaults
+    anyway, because a `Channel` with neither set is reported for inspection
+    rather than guessed at.
     """
     cls = type(entity).__name__
     if cls == "Channel":
@@ -110,22 +109,24 @@ def main() -> int:
     needle = args.filter.lower()
     rows: list[tuple[int, str, str, str]] = []
 
-    # VERIFY: TelegramClient(session, api_id, api_hash) and the sync context
-    # manager that runs .start() interactively are the documented entry points:
-    # https://docs.telethon.dev/en/stable/basic/signing-in.html
+    # TelegramClient(session, api_id, api_hash) with the sync context manager
+    # that runs .start() interactively. Verified against telethon 1.45.
     with TelegramClient(SESSION_NAME, api_id, api_hash) as client:
         me = client.get_me()
         print(f"Signed in as: {getattr(me, 'username', None) or me.id}\n")
 
-        # VERIFY: iter_dialogs() yields Dialog objects with .entity and .name:
-        # https://docs.telethon.dev/en/stable/modules/client.html#telethon.client.dialogs.DialogMethods.iter_dialogs
+        # iter_dialogs() yields Dialog objects carrying .entity, .name and .id.
+        # Verified against telethon 1.45.
         for dialog in client.iter_dialogs():
             title = (dialog.name or "").strip() or "(untitled)"
             if needle and needle not in title.lower():
                 continue
             kind, note = _classify(dialog.entity)
             # get_peer_id returns the canonical *marked* id — the -100... form
-            # that config expects. dialog.id should agree; prefer this one.
+            # config expects, which keeps a user id from colliding with a chat
+            # id. `Dialog.id` is assigned as `get_peer_id(self.entity)` in
+            # telethon 1.45, so the two agree by construction; this spells it
+            # out rather than depending on that internal.
             rows.append((get_peer_id(dialog.entity), kind, title, note))
 
     if not rows:

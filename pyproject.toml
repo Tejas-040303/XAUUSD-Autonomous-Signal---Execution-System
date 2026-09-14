@@ -1,0 +1,41 @@
+[project]
+name = "xauusd-bot"
+version = "0.0.0"
+description = "Autonomous XAUUSD signal-to-execution system (see README.md for the spec)"
+requires-python = ">=3.11"
+
+# Kept deliberately small. Telethon and MetaTrader5 arrive with the modules that
+# need them, not before — MetaTrader5 is Windows-only and must not become an
+# import-time dependency of anything testable on Linux (CLAUDE.md, unresolved item 2).
+dependencies = [
+  "pydantic>=2.0",
+  "pydantic-settings>=2.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "hypothesis>=6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["xauusd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Every safety rule needs a test (CLAUDE.md). Fail on an unknown marker rather
+# than silently skipping a suite.
+addopts = "-q --strict-markers --strict-config"
+markers = [
+  "property: property-based test over generated inputs",
+]
+
+[tool.hypothesis]
+# Deterministic by default: a money-path property test that only fails on some
+# seeds is worse than no test, because it teaches the team to re-run until green.
+derandomize = true

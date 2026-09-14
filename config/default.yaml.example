@@ -1,0 +1,117 @@
+# XAUUSD bot configuration — TEMPLATE
+#
+# Copy to config/local.yaml (gitignored) and fill in. Every value below is
+# REQUIRED: there are no defaults, so a missing key is a startup failure rather
+# than a silently applied fallback. Startup also refuses unknown keys, so a typo
+# fails loudly instead of leaving the real field unset.
+#
+# Values marked <<< FROM BROKER >>> must be read from the broker's contract
+# specification. Do not guess them.
+
+symbol:
+  # The EXACT broker symbol string. Real brokers use XAUUSD, XAUUSD.m, XAUUSDm,
+  # XAUUSD.raw, GOLD — and some carry two gold instruments with different
+  # contract sizes on one account.
+  name: "XAUUSD"                  # <<< FROM BROKER >>>
+  digits: 2                       # <<< FROM BROKER >>>
+  point: "0.01"                   # <<< FROM BROKER >>>  smallest price increment
+
+  # THE BLOCKING VALUE. Price value of one pip.
+  #
+  # Spec §13 forbids assuming 1 pip == 1 point, and §6/§7/§14/§16 then state
+  # every limit in pips. XAUUSD is 100 oz/lot, so 0.01 lots is 1 oz and a $1
+  # price move is $1. Against the $50 daily loss limit, a 70-pip stop on the
+  # smallest placeable lot costs:
+  #
+  #   pip = 0.01  ->   $0.70   the limit never binds
+  #   pip = 0.10  ->   $7.00   works: four losses = $28
+  #   pip = 1.00  ->  $70.00   140% of the daily limit on the MINIMUM trade,
+  #                            so the bot would have to reject every signal
+  #
+  # Get it from the contract spec.
+  pip_size: "0.10"                # <<< FROM BROKER >>>
+
+  contract_size: "100"            # <<< FROM BROKER >>>  units per lot (oz)
+  volume_min: "0.01"              # <<< FROM BROKER >>>
+  volume_max: "50"                # <<< FROM BROKER >>>
+  volume_step: "0.01"             # <<< FROM BROKER >>>
+
+  # Two DIFFERENT constraints with different remedies: recompute further out
+  # fixes stops_level; only waiting fixes freeze_level. Both are often 0 on
+  # gold, and some brokers widen them around news.
+  stops_level_points: 50          # <<< FROM BROKER >>>
+  freeze_level_points: 20         # <<< FROM BROKER >>>
+
+sessions:
+  # All times IST (spec §4). Stored timestamps are UTC; IST is derived.
+  morning:
+    start: "05:30"
+    end: "09:00"
+  evening:
+    start: "20:00"
+    # REQUIRED, no default. Spec §4: "do not assume that after 8 PM means the
+    # bot can continuously trade all night." Must not cross midnight — a
+    # cross-midnight window would roll DailyState mid-session and reset
+    # evening_consumed, permitting a second evening trade.
+    end: "23:30"
+
+risk:
+  daily_loss_limit: "50"          # account currency, vs starting-day equity
+  min_sl_pips: "10"
+  max_sl_pips: "70"               # reject above; never clamp to fit
+  max_sl_pips_evening: "40"       # spec §7, stricter than the global cap
+  min_rr: "1"                     # measured entry -> FINAL TP, not TP1
+  max_daily_trades_morning: 3
+  max_daily_trades_evening: 1     # spec §7
+  max_entry_distance_pips: "15"   # replaces spec §12's 0.005 relative test
+  max_spread_pips: "8"
+  protective_buffer_pips: "15"    # spec §14
+  expected_slippage_pips: "3"
+  large_target_pips: "170"        # spec §16 staged-exit classifier
+  successful_trade_pips: "70"     # spec §6
+  required_70pip_wins_for_evening: 2      # spec §7
+  consecutive_losses_to_disable_morning: 3  # spec §8
+
+execution:
+  magic: 770401                   # stamped on every order this bot places
+  max_order_frequency_seconds: 60 # spec §24 — ENTRIES only
+  max_deviation_points: 20
+  orphan_sweep_seconds: 60        # spec §22
+  tp_poll_seconds: "1"
+  max_tick_age_seconds: "5"       # reject decisions made on a stale tick
+
+telegram:
+  # Numeric chat_id only, never an @username: a released username can be
+  # re-registered by anyone, and a group->supergroup migration changes the id.
+  # Resolve a username to an id once, by hand, then pin the number here.
+  sources:
+    - chat_id: -1001234567890     # <<< YOUR SIGNAL CHANNEL >>>
+      kind: "channel"             # "channel" (broadcast) or "group"
+      # Who may originate a tradeable signal. Nothing in spec §1-§46 says.
+      # REQUIRED non-empty for a group, where any member can post. May be empty
+      # for a broadcast channel, because anonymous admin posts arrive with the
+      # channel itself as sender.
+      allowed_sender_ids: []
+
+  # MUST differ from every source. Posting status into a source makes the bot's
+  # own message quoting a price re-ingestible as a signal.
+  status_chat_id: -1009876543210  # <<< SEPARATE STATUS CHAT >>>
+
+  heartbeat_seconds: 180          # 3-minute position updates
+  max_image_bytes: 8388608
+  max_image_pixels: 40000000      # decompression-bomb ceiling
+  max_signal_age_seconds: "300"   # time staleness; §12 only checks price
+  dedupe_window_seconds: 86400    # spec §23's third component
+
+database:
+  # Separate files on purpose: the archive is unbounded and holds untrusted
+  # third-party content, and filling its disk must not stop the ledger from
+  # recording losses — if daily_state writes fail, losses stop being counted
+  # and the kill switch can never trip.
+  trading_path: "data/trading.db"
+  archive_path: "data/archive.db"
+  busy_timeout_ms: 5000
+
+# Credentials are NOT here. Telegram api_id/api_hash, the bot token and MT5
+# login details are read from the environment or an OS keyring, never from a
+# file in the repo. This repository is public.

@@ -67,38 +67,75 @@ trade count. If a change would relax one, **stop and raise it** rather than impl
 ## Trading rules
 
 ```text
-Morning entries          05:30–09:00 IST
-Evening entries          from 20:00 IST — end time is REQUIRED config, no default
-Max concurrent positions 1
-Order rate limit         1 new ENTRY / 60s (modifications, closes, partial closes NOT throttled)
+Max concurrent positions   1
+Order rate limit           1 new ENTRY / 60s
+                           (modifications, closes, partial closes NOT throttled)
 ```
 
-**Three consecutive losses** → disable morning entries. A win resets the counter.
+### Morning session
 
-**Two completed winning trades >= 70 pips** → permit one evening trade, subject to all other
-rules. Evening SL/risk maximum: **40 pips**.
+```text
+New entries        05:30 – 09:00 IST
+Outside window     NO NEW ENTRY — existing positions are still managed
+Session close      never force-closes a position unless a risk policy says so (spec §4)
+```
+
+**Three consecutive losses** → morning new entries DISABLED. The losses must be consecutive; a
+winning trade resets the counter to 0.
+
+### Evening session
+
+```text
+New entries        from 20:00 IST
+End time           configurable (spec §4) — REQUIRED config, no default
+Max new trades     1 per evening  (evening_trade_consumed)
+Max SL / risk      40 pips
+Precondition       successful_70pip_trades_today >= 2
+```
+
+Even with morning disabled, the evening remains **MAX 1 NEW TRADE**. It is not an unlimited
+recovery opportunity (spec §8).
+
+Passing the evening precondition does **not** make a signal tradeable — *trade eligibility* and
+*signal validity* are separate (spec §7, §41). The signal still runs every parser, confidence,
+price, SL, TP, spread, risk and execution check.
 
 A "successful 70+ pip trade" is a *realized* winner with validated movement >= 70 pips.
 Touching +70 then losing does not count. Reaching TP1 alone does not count (spec §6).
 
-### TP ladder — driven by TP count, not distance
+`end` has no invented default: an unbounded overnight session is the failure spec §4 warns
+against ("do not assume that after 8 PM means the bot can continuously trade all night"), so
+startup fails closed until a value is set.
+
+### TP ladder — driven by target distance (spec §15, §16)
 
 ```text
-1 TP     → single full exit, no partial ladder
-2 TPs    → TP1 close 50%          → TP2 close remaining 50%
-3 TPs    → TP1 close 50%          → TP2 close 50% OF REMAINING (25% of original)
-                                  → TP3 close remainder
-4+ TPs   → REJECT (TP_COUNT_UNSUPPORTED) — do not guess a ladder
+Standard target  (< 170 pips)
+  TP1        → close 50%
+  Final TP   → close remaining 50%
+
+Large target    (>= 170 pips)
+  TP1        → close 50%
+  TP2        → close 50% OF REMAINING   (25% of original)
+  Final TP   → close remainder          (25% of original)
 ```
 
-TP1 distance comes from the signal (30 / 35 / 60 / 75+ pips, market dependent). It is **not** a
-configured constant. TP2 is 50% of *remaining* volume, never another 50% of the original.
+TP2 is **50% of remaining volume**, never another 50% of the original. Worked example on 2.00
+lots: TP1 closes 1.00 (1.00 left) → TP2 closes 0.50 (0.50 left) → final TP closes 0.50.
 
-> **OPEN CONFLICT — do not resolve without asking.** Spec §16 keys the staged exit on
-> *distance* (`target >= 170 pips`). The rule above keys it on *TP count*, per explicit
-> instruction. The two disagree, and a 2-TP signal with a 200-pip TP2 has no TP3 to stage on.
-> The TP-count rule is authoritative; the 170-pip threshold is retained only as a **logged
-> label** for analytics. Confirm before changing either.
+TP1 *distance* comes from the signal (30 / 35 / 60 / 75+ pips, market dependent) and is **not** a
+configured constant. The 170-pip threshold classifies the trade; it does not set any TP level.
+
+**Unresolved, ask before coding:**
+
+- "Target distance" is assumed to mean **entry → final TP**. Spec §16 does not say which target
+  it measures. If it means entry → TP1, the classification changes for most signals.
+- **Large target but only 2 TPs in the signal** — the 3-stage ladder has no third level to exit
+  at. Assumed: degrade to `50% / 50%` at the two levels given. Do not synthesise a third level.
+- **Standard target but 3 TPs in the signal** — assumed: honour the signal's levels
+  (`50% / 25% / 25%`), since exiting requires a level the signal actually specifies.
+- `1 TP` → single full exit, no partial ladder. `4+ TPs` → **reject**
+  (`TP_COUNT_UNSUPPORTED`); do not guess a ladder. Non-monotonic or wrong-side TPs → reject.
 
 ### After TP1 — protective SL
 

@@ -18,6 +18,12 @@ dev = [
   "pytest>=8.0",
   "hypothesis>=6.0",
 ]
+# Telegram ingestion. Kept optional because the trading logic must stay
+# testable without it, and because telethon's pyaes dependency does not build
+# in every environment (it fails in this project's CI container).
+telegram = [
+  "telethon>=1.34",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

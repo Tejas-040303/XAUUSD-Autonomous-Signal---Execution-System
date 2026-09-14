@@ -18,7 +18,8 @@ trade count. If a change would relax one, **stop and raise it** rather than impl
 2. Every position must have an SL. Not protected until the **broker confirms** it (spec §20).
 3. Never increase risk because of ambiguity.
 4. Never silently guess financial instructions.
-5. Entry confidence must be `>= 0.95`.
+5. Entry confidence requires **full parser consensus plus all deterministic validation
+   passing**. There is no numeric threshold — see Confidence below.
 6. Image parser disagreement means rejection. Never average, never prefer the "more reasonable"
    parse, never add a third tiebreaker heuristic (spec §11).
 7. Daily kill switch requires manual re-arm. Survives restart, crash, reconnect, deploy — and
@@ -308,6 +309,32 @@ bug. Expect code that rejects far more than it accepts.
 `policy` and `risk` are pure functions over `(signal, daily_state, clock, config)` — no I/O, no
 broker, no model. That is what makes spec §39's exhaustive rule testing cheap.
 
+## Confidence
+
+Confidence is **computed, never asked for**. A model that reports its own confidence is reporting
+a number an injected instruction can set, and §44 forbids increasing risk because a model thinks
+it is probably correct.
+
+```text
+both parsers agree on every critical field
+  AND all deterministic validation passes        → proceed
+anything else                                    → REJECT
+```
+
+Critical fields are direction, entry, SL, and every TP level (spec §11).
+
+**There is no numeric confidence threshold.** §38's `minimum_entry_confidence: 0.95` is deleted:
+with a binary outcome every threshold in `(0, 1]` behaves identically, so it was a safety
+constant that could not change behaviour while appearing to. Do not reintroduce it. §9's intent
+is preserved exactly — the bar is total agreement, which is stricter than 0.95, not looser.
+
+If a graded score is ever wanted, it must come from **measured per-field parser accuracy** on the
+labelled corpus, never from the model's own output.
+
+Note the boundary this does *not* cover: consensus exists only for images. A text-only signal has
+one model in the path, so it needs a deterministic regex/grammar extractor as its second parser —
+text is easier to parse deterministically than images, so there is no excuse for skipping it.
+
 ## Correlating follow-up messages
 
 Priority (spec §18): reply-to id (1.0) → unique price match within 50 pips (0.90) → unique
@@ -355,14 +382,8 @@ consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
 4. **Entry proximity.** Spec §12's `abs(entry − mid)/mid < 0.005` is 0.5% ≈ `$13.25` at gold
    2650 — 3× to 30× the evening 40-pip cap, so it will not catch a stale signal. Replaced by a
    configurable `max_entry_distance_pips`; the value is unchosen.
-5. **Confidence semantics.** §9 gates at `< 0.95` but §11's double-parse is binary, and a
-   model's self-reported confidence would contradict §44. Current rule: confidence is *computed*
-   — full agreement plus all deterministic validation passing = 1.0, any disagreement = 0.0. A
-   graded score would have to come from measured per-field accuracy, never from the model.
-   Consequence to resolve: with a binary value, §38's `minimum_entry_confidence: 0.95` cannot
-   change behaviour, so it is a safety constant that provably does nothing. Either delete it and
-   restate §9 as "consensus + validation required", or build a graded score from measured
-   accuracy. Do not leave it as-is.
+5. **Evening after three losses** — see item 3. (Confidence semantics resolved: see the
+   Confidence section above.)
 6. **How 70 pips is measured *within* one trade.** The counting rule is settled (two separate
    trades, never summed). The measurement inside a trade is not. Three readings disagree on the
    normal case: volume-weighted exit distance, maximum favourable excursion plus a winning
@@ -379,14 +400,46 @@ consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
    channel can reply to anything. Code that cannot widen an SL cannot be made to by a bug, a
    misparse, injected screenshot text, or a compromised channel. Awaiting decision.
 
+## Commands
+
+```bash
+python3 -m pip install -e '.[dev]'   # install (Python 3.11+)
+python3 -m pytest                    # full suite
+python3 -m pytest tests/test_price.py -k partial_close   # one test or pattern
+python3 -m pytest -m property         # property-based tests only
+python3 -m pytest -p no:randomly -x   # stop at first failure
+```
+
+No linter or formatter is configured yet. Do not add one to a commit that also changes
+behaviour — a reformat diff hides the change it travels with.
+
 ## Repository state
 
-No source code yet. `README.md` is the spec; `PAPER_AGENT_SPEC.md` is an intentionally frozen
-reference copy of it — `README.md` may diverge in future, and that divergence is expected, not
-drift to be "fixed". Do not reconcile them.
+`README.md` is the spec; `PAPER_AGENT_SPEC.md` is an intentionally frozen reference copy of it —
+`README.md` may diverge in future, and that divergence is expected, not drift to be "fixed". Do
+not reconcile them.
 
-There are no build/lint/test commands yet. When the first code lands, establish them in the same
-change and record them here. Do **not** invent commands for tooling that is not in the repo.
+P0 foundations exist. Nothing trades, nothing connects to Telegram or a broker.
+
+```text
+xauusd/clock.py           the ONLY wall-clock reader; UTC stored, IST derived
+xauusd/price.py           all pip/point/volume/stop arithmetic; owns the pip definition
+xauusd/config/schema.py   fail-closed config; every safety value required, no defaults
+xauusd/db/store.py        connection factory; synchronous=FULL on the trading DB
+config/default.yaml.example   template; <<< FROM BROKER >>> marks what must be looked up
+tests/                    140 tests, incl. property tests over all three pip conventions
+```
+
+Two conventions worth knowing before adding to this:
+
+- **The unresolved pip value does not block writing code, only running it.** `PriceUtils` takes
+  a `SymbolSpec` by injection and config requires `pip_size` with no default, so the module is
+  complete and fully tested while the system refuses to start until a real value is supplied.
+  Apply the same shape to anything else that is undecided: encode it as required config, never
+  as a placeholder default.
+- **`tests/test_architecture.py` enforces the layer rules with `ast`,** not grep, so an aliased
+  import cannot slip past. Rules for modules that do not exist yet are already written there and
+  skip until their module lands — add the rule when you plan the module, not after.
 
 > Note on history: commit `8a505a2` ("Update print statement from 'Hello' to 'Goodbye'") actually
 > overwrote `PAPER_AGENT_SPEC.md`, which previously held a different 968-line document —

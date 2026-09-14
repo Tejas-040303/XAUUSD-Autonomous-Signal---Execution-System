@@ -185,6 +185,15 @@ class TelegramConfig(BaseModel):
     model_config = _STRICT
 
     sources: list[TelegramSource] = Field(min_length=1)
+    session_path: Path = Field(
+        description=(
+            "Where telethon's MTProto session file lives. The FILE is a full-account "
+            "credential: it grants API access to the account and bypasses both the "
+            "account password and 2FA, and is revoked only by terminating the session "
+            "from another device. Keep it off any path that gets committed, imaged or "
+            "backed up; .gitignore covers *.session but not a container layer."
+        )
+    )
     status_chat_id: int = Field(
         description=(
             "Outbound status/heartbeat destination. MUST differ from every source: "
@@ -215,6 +224,77 @@ class TelegramConfig(BaseModel):
         return self
 
 
+class ArchiveConfig(BaseModel):
+    """Corpus building and history coverage (spec §28)."""
+
+    model_config = _STRICT
+
+    media_root: Path = Field(
+        description=(
+            "Directory the screenshot corpus is written to. Paths inside it are "
+            "derived only from ids we assign — never from a sender-supplied filename."
+        )
+    )
+    backfill_batch_size: int = Field(
+        gt=0,
+        le=1000,
+        description=(
+            "Message ids per fetch. Bounds both the request size and how much work "
+            "is redone after a crash, since a range is only marked scanned once every "
+            "message in it is recorded."
+        ),
+    )
+    backfill_oldest_message_id: int = Field(
+        ge=1,
+        description=(
+            "How far back history is walked. 1 means the whole channel. Raise it to "
+            "bound a first run against years of history."
+        ),
+    )
+    backfill_max_windows_per_run: int = Field(
+        gt=0,
+        description="Batches per invocation, so a large first backfill can be done in sessions.",
+    )
+    media_poll_seconds: Decimal = Field(
+        gt=0, description="How often the live listener drains pending attachments."
+    )
+    max_download_attempts: int = Field(
+        gt=0,
+        description="After this many transport failures an attachment becomes a permanent rejection.",
+    )
+    size_mismatch_tolerance: Decimal = Field(
+        ge=0,
+        lt=1,
+        description=(
+            "Permitted drift between the declared byte size and what landed. Telegram "
+            "re-encodes photos, so some drift is normal and a lot of it is not."
+        ),
+    )
+
+
+class NotifyConfig(BaseModel):
+    """Outbox drain behaviour. Never on the execution path."""
+
+    model_config = _STRICT
+
+    lease_seconds: Decimal = Field(
+        gt=0,
+        description=(
+            "How long a claimed message stays claimed. A drainer killed mid-send "
+            "strands the row until this expires, so it bounds recovery time."
+        ),
+    )
+    max_attempts: int = Field(
+        gt=0,
+        description=(
+            "Delivery attempts before a message becomes terminally failed. Failed "
+            "messages are kept, never dropped: an undelivered SL_HIT is evidence."
+        ),
+    )
+    drain_interval_seconds: Decimal = Field(gt=0)
+    claim_batch: int = Field(gt=0, le=100)
+
+
 class DatabaseConfig(BaseModel):
     model_config = _STRICT
 
@@ -240,6 +320,8 @@ class Config(BaseModel):
     risk: RiskConfig
     execution: ExecutionConfig
     telegram: TelegramConfig
+    archive: ArchiveConfig
+    notify: NotifyConfig
     database: DatabaseConfig
 
     @model_validator(mode="after")
@@ -261,6 +343,28 @@ class Config(BaseModel):
                 f"= {floor} pips, which is not below max_sl_pips ({self.risk.max_sl_pips}). "
                 "Every signal would degenerate to a single exit."
             )
+
+        # The media tree is unbounded and holds untrusted third-party bytes. A
+        # database file inside it would be exposed to the same disk pressure the
+        # two-database split exists to avoid, and to anything that ever decides
+        # to clean the corpus directory.
+        media_root = self.archive.media_root.resolve()
+        for label, db_path in (
+            ("trading_path", self.database.trading_path),
+            ("archive_path", self.database.archive_path),
+        ):
+            resolved = db_path.resolve()
+            if resolved == media_root or media_root in resolved.parents:
+                raise ValueError(
+                    f"database.{label} ({db_path}) is inside archive.media_root "
+                    f"({self.archive.media_root}). The media tree grows without bound and "
+                    "holds untrusted content; a database file must not share its disk fate."
+                )
+
+        # The retry cap and the attempt ceiling the fetcher compiles against must
+        # agree, or a config change silently has no effect.
+        if self.archive.max_download_attempts < 1:
+            raise ValueError("max_download_attempts must be at least 1")
         return self
 
 

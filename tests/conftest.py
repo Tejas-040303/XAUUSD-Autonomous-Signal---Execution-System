@@ -69,3 +69,54 @@ def broker_spec() -> SymbolSpec:
         stops_level_points=50,  # 5 pips at 0.10/pip
         freeze_level_points=20,  # 2 pips
     )
+
+
+# -- archiver fixtures --------------------------------------------------------
+
+
+@pytest.fixture
+def archive_db(tmp_path):
+    """A migrated archive database. Function-scoped: these tests mutate it."""
+    from xauusd.db.migrate import migrate
+    from xauusd.db.store import Role, connect
+
+    conn = connect(tmp_path / "archive.db", Role.ARCHIVE)
+    migrate(conn, Role.ARCHIVE)
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def trading_db(tmp_path):
+    """A migrated trading database, with synchronous=FULL asserted by connect()."""
+    from xauusd.db.migrate import migrate
+    from xauusd.db.store import Role, connect
+
+    conn = connect(tmp_path / "trading.db", Role.TRADING)
+    migrate(conn, Role.TRADING)
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def limits():
+    from xauusd.archive.media import MediaLimits
+
+    return MediaLimits(max_bytes=8 * 1024 * 1024, max_pixels=40_000_000)
+
+
+@pytest.fixture
+def frozen_clock():
+    """A clock stopped at a morning-session instant (05:45 IST = 00:15 UTC)."""
+    from datetime import datetime, timezone
+
+    from xauusd.clock import FakeClock
+
+    return FakeClock(at=datetime(2026, 9, 14, 0, 15, tzinfo=timezone.utc))
+
+
+@pytest.fixture
+def media_root(tmp_path):
+    root = tmp_path / "media"
+    root.mkdir()
+    return root

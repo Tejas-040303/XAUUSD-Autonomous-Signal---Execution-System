@@ -190,3 +190,105 @@ def test_every_module_is_importable():
     for module in _modules():
         dotted = _rel(module)[: -len(".py")].replace("/", ".")
         importlib.import_module(dotted)
+
+
+# ---------------------------------------------------------------------------
+# One place reads credentials
+# ---------------------------------------------------------------------------
+
+SECRETS_MODULE = "xauusd/config/secrets.py"
+
+
+@pytest.mark.parametrize("module", _modules(), ids=_rel)
+def test_only_the_secrets_module_reads_the_environment(module: Path):
+    """Credentials enter the process at exactly one point.
+
+    Not tidiness: `secrets.py` redacts in `__repr__` and raises errors that name
+    the variable rather than the value. A credential read anywhere else bypasses
+    both, and ends up in a traceback, a log aggregator, or an issue report. This
+    repository is public and a push cannot be undone.
+    """
+    if _rel(module) == SECRETS_MODULE:
+        return
+    chains = _attribute_chains(_parse(module))
+    forbidden = {"os.environ", "os.getenv", "os.environ.get"}
+    found = chains & forbidden
+    assert not found, (
+        f"{_rel(module)} reads the environment directly ({sorted(found)}). "
+        f"Load credentials through {SECRETS_MODULE}, which redacts them."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The pure archive layers stay pure
+# ---------------------------------------------------------------------------
+
+# These four decide admission, identity and coverage. Keeping them free of I/O
+# is what makes them exhaustively property-testable — the coverage algebra in
+# particular, where a wrong answer loses signals silently.
+PURE_ARCHIVE = {
+    "xauusd/archive/content.py": ("sqlite3", "telethon", "anthropic", "MetaTrader5"),
+    "xauusd/archive/ranges.py": ("sqlite3", "telethon", "anthropic", "MetaTrader5"),
+    "xauusd/archive/media.py": ("sqlite3", "telethon", "anthropic", "MetaTrader5"),
+    "xauusd/telegram/model.py": ("sqlite3", "telethon", "anthropic", "MetaTrader5"),
+}
+
+
+@pytest.mark.parametrize("module", sorted(PURE_ARCHIVE), ids=lambda p: p)
+def test_decision_layers_import_no_io(module: str):
+    path = PACKAGE.parent / module
+    assert path.is_file(), f"{module} is missing; update PURE_ARCHIVE if it moved"
+    names = _imported_names(_parse(path))
+    banned = PURE_ARCHIVE[module]
+    bad = [n for n in names if any(n == b or n.startswith(f"{b}.") for b in banned)]
+    assert not bad, f"{module} must stay free of I/O; it imports {bad}"
+
+
+# ---------------------------------------------------------------------------
+# Every stored timestamp goes through one formatter
+# ---------------------------------------------------------------------------
+
+_TIMESTAMP_COLUMNS_EXEMPT = {TIME_SOURCE}
+
+
+@pytest.mark.parametrize("module", _modules(), ids=_rel)
+def test_no_module_formats_a_timestamp_by_hand(module: Path):
+    """`clock.iso_utc` is the only writer of the stored form.
+
+    The schema's CHECK constraints require a literal `Z`, and Python's own
+    `isoformat()` renders UTC as `+00:00`. A column holding both spellings
+    breaks range comparisons on the boundary silently — which is how a dedupe
+    window ends up wrong by hours.
+    """
+    if _rel(module) in _TIMESTAMP_COLUMNS_EXEMPT:
+        return
+    chains = _attribute_chains(_parse(module))
+    # `iso_utc` itself calls isoformat; nothing else may.
+    assert "isoformat" not in {c.rsplit(".", 1)[-1] for c in chains}, (
+        f"{_rel(module)} formats a datetime itself. Use clock.iso_utc so every "
+        f"stored timestamp has one spelling."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Archiving cannot reach the trading decision layers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "module",
+    [m for m in _modules() if _rel(m).startswith(("xauusd/archive/", "xauusd/telegram/"))],
+    ids=_rel,
+)
+def test_ingestion_does_not_import_decision_layers(module: Path):
+    """Spec §44's boundary, in the direction that is easy to violate.
+
+    The archive records what was said. Whether it is tradeable is four separate
+    questions answered by four later layers (spec §41). An import from here into
+    `policy` or `risk` is how "we archived a signal" starts meaning "we approved
+    one".
+    """
+    forbidden = ("xauusd.policy", "xauusd.risk", "xauusd.broker", "xauusd.execution")
+    names = _imported_names(_parse(module))
+    bad = [n for n in names if n.startswith(forbidden)]
+    assert not bad, f"{_rel(module)} imports a decision layer: {bad}"

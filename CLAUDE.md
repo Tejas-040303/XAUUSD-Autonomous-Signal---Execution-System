@@ -238,6 +238,125 @@ every transition: `SL_HIT`, `BE_MOVED`, `TP1_FILLED`, `TP2_FILLED`, `FINAL_TP`, 
 rejection with the full broker retcode, constant name and message. Delivered via a DB outbox
 drained by a separate loop — a Telegram outage must never block or delay execution.
 
+The outbox exists (`xauusd/notify/outbox.py`). Three properties to preserve when the execution
+engine starts using it:
+
+- **Enqueue inside the caller's transaction.** "We moved the stop" and "we said we moved the stop"
+  commit together or not at all.
+- **Priority, not insertion order.** After a ten-minute outage, a queue ordered purely by arrival
+  delivers two hundred stale heartbeats before the `SL_HIT` that happened during it. An operator
+  told about a stop forty minutes late has been actively misled.
+- **Heartbeats collapse, events never.** A heartbeat is a snapshot, so an older pending one carries
+  no information once a newer exists; it is replaced in place, keeping its queue position. Event
+  messages carry no collapse key — losing one loses the record.
+
+Delivery is **at-least-once**: the Bot API has no client-supplied idempotency key, so a crash
+between sending and recording resolves toward a duplicate. A repeated `SL_HIT` notice is noise; a
+missing one is an operator who does not know their stop was hit. Terminally undelivered messages
+are **kept, never dropped** — an undelivered `SL_HIT` is evidence about the incident — and surfaced
+at startup.
+
+Run **exactly one drainer**. Two would each claim disjoint rows but could deliver out of order, and
+`TP1_FILLED` arriving after `FINAL_TP` reads as a different trade.
+
+## Archive and duplicate detection
+
+The archive is **evidence**, not a cache. It answers "what exactly did the provider post, and
+when did we see it" months later — including for a message since edited or deleted. So nothing in
+it is ever destructively updated or deleted:
+
+- an **edit** appends a revision to `message_edits`; `messages.text` stays as first posted, because
+  the SL we actually traded has to stay provable when the provider changes it afterwards;
+- a **deletion** is recorded in `message_deletions` and the row stays. A provider removing a
+  losing call is exactly what the archive exists to remember.
+
+### `content_hash` — specified here, undefined in the spec
+
+Spec §23 requires duplicate handling but never says what makes two messages "the same". The
+definition:
+
+```text
+content_hash = sha256(canonical_json({
+    "v":     HASH_VERSION,
+    "text":  normalized_text,          # NFKC, strip Unicode Cf + Cc, collapse ws, casefold
+    "media": [sha256 of each attachment, in order],
+}))
+```
+
+**Content hashing never decides whether a message is archived.** The archive is keyed on
+`(chat_id, message_id)`, which is the only uniqueness it enforces. The hash is a *lead* for the
+signal layer, stored beside the message, indexed and never constrained.
+
+That separation is load-bearing. The obvious implementation — hash the text, make it unique —
+destroys the corpus §28 depends on: every image-only message has empty text, so they all hash
+alike and every screenshot after the first is discarded as a duplicate. The screenshots *are* the
+corpus. Hence:
+
+- media contributes its **bytes** to the hash, so two different screenshots never collide and two
+  identical ones always do;
+- a message with neither text nor media hashes to **NULL**, not `sha256("")`. "Cannot be compared"
+  is not "equal to every other empty thing", and a NULL deliberately matches nothing in SQL, so
+  the fail-closed behaviour is automatic at the query layer;
+- normalisation strips Unicode `Cf` (zero-width space, joiner, BOM, bidi marks). These are
+  invisible, so a single injected `U+200B` would otherwise produce a "new" signal that renders
+  identically to one already acted on — a duplicate trade for free, invisible in review;
+- emoji **survive**. A red circle against a green one may be the only thing distinguishing a sell
+  from a buy in this channel's format.
+
+The rule is versioned. A stored hash is comparable only to another of the same `HASH_VERSION`.
+
+### Unresolved media is not "no duplicate"
+
+`content_state` is one of `complete` / `pending_media` / `media_failed`, and the hash is set only
+once every attachment is terminal:
+
+| media state | contributes | message identity |
+|---|---|---|
+| stored | its `sha256` | computable |
+| rejected by policy (wrong type, too large, bomb) | a stable namespaced token | computable |
+| pending / retryable failure | nothing | **NULL — not comparable** |
+
+A policy rejection is *known* content — we can say exactly what it was and why, identically on
+every re-scan — so it does not block the fingerprint, and a text signal carrying a stray PDF stays
+comparable. A fetch *failure* is unknown, so it does. A message with a NULL hash must never be
+judged a duplicate, and the signal layer must equally refuse to act on one: we cannot prove it is
+not a repeat.
+
+### Coverage is intervals, not a watermark
+
+Telegram message ids are **not contiguous** — deletions and service messages consume them — so
+"id 4243 is absent from the archive" does not mean it was missed. And a high-water mark cannot
+express a hole: backfill walks history *backwards*, so an interrupted run leaves the newest block
+present and an older block missing, and a watermark reports "scanned to the newest", which is true
+and useless.
+
+So `scan_ranges` stores closed intervals actually looked at, merged and non-overlapping. The
+complement within a window is the work still to do. **Scanned-and-absent is thereby distinguished
+from never-looked-at**, which is the distinction the whole design turns on.
+
+`max_scanned()` is reporting only — never a resume point. Every coverage question goes through
+`gaps()`.
+
+### The ordering that makes a crash survivable
+
+**Messages are recorded before their range is marked scanned, always.** Separate transactions, so
+a crash between them re-scans a window already archived — harmless, because every archive write is
+idempotent. The opposite order marks coverage for messages never stored, and nothing looks at that
+range again. One direction costs duplicate work; the other loses signals permanently and silently.
+
+### Media is hostile input
+
+Three defences, in order: admission on Telegram's declared MIME/size/dimensions **before any bytes
+transfer** (so a 900-megapixel bomb costs no bandwidth and a posted `.exe` is never fetched);
+paths built **only** from ids we assign, with the extension from a MIME allowlist, so
+`DocumentAttributeFilename.file_name` — attacker-controlled text — cannot become a traversal or a
+Windows reserved-device bug; and verification of the actual bytes afterwards, because the
+declaration was only ever a claim.
+
+Declared dimensions reduce the attack surface, they do not close it: a JPEG header can lie, and
+the real pixel count is known only to a decoder. **P1 must re-assert `max_image_pixels` against
+the decoded image**, which is the only place that truth exists.
+
 ## Order state machine
 
 `UNKNOWN` is an **order-request** outcome, not a trade outcome. SL/BE/TP describe a position that
@@ -354,6 +473,11 @@ mode → `P3` Execution + position management (demo). Live is a go/no-go decisio
 not a phase. Do not develop the parser against invented examples — build the real corpus first
 (spec §28).
 
+**P0 is done.** P1 cannot start until the archiver has actually run against the real channel:
+the corpus is its input, and a parser developed against invented screenshots measures nothing.
+The two things P1 needs first are a labelled corpus and a decision on the text-only second
+parser (see Confidence — a deterministic grammar, not a second model).
+
 **Live gate** (spec §31), a minimum bar not a target: zero direction errors across 100
 consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
 
@@ -403,12 +527,30 @@ consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
 ## Commands
 
 ```bash
-python3 -m pip install -e '.[dev]'   # install (Python 3.11+)
-python3 -m pytest                    # full suite
+python3 -m pip install -e '.[dev]'        # install (Python 3.11+)
+python3 -m pip install -e '.[telegram]'   # adds telethon; enables the conversion tests
+python3 -m pytest                         # full suite
 python3 -m pytest tests/test_price.py -k partial_close   # one test or pattern
-python3 -m pytest -m property         # property-based tests only
-python3 -m pytest -p no:randomly -x   # stop at first failure
+python3 -m pytest -m property             # property-based tests only
+python3 -m pytest -p no:randomly -x       # stop at first failure
 ```
+
+The archiver:
+
+```bash
+python3 -m xauusd.run_archiver --config config/local.yaml check      # no network, no credentials
+python3 -m xauusd.run_archiver --config config/local.yaml backfill   # walk history
+python3 -m xauusd.run_archiver --config config/local.yaml live       # backfill, then listen
+python3 tools/resolve_chat_ids.py --filter VIP   # find a chat_id; channel or group?
+```
+
+`check` applies pending migrations; `backfill` and `live` refuse to run against an unmigrated
+database unless `--migrate` is passed, so booting never alters the ledger's shape as a side
+effect.
+
+If telethon fails to build (`pyaes` + a Debian-patched setuptools raising
+`AttributeError: install_layout`), install it inside a venv, which brings its own modern
+setuptools.
 
 No linter or formatter is configured yet. Do not add one to a commit that also changes
 behaviour — a reformat diff hides the change it travels with.
@@ -419,18 +561,38 @@ behaviour — a reformat diff hides the change it travels with.
 `README.md` may diverge in future, and that divergence is expected, not drift to be "fixed". Do
 not reconcile them.
 
-P0 foundations exist. Nothing trades, nothing connects to Telegram or a broker.
+**P0 is complete.** Nothing trades and no broker code exists; the archiver can connect to
+Telegram once credentials and a `chat_id` are supplied.
 
 ```text
-xauusd/clock.py           the ONLY wall-clock reader; UTC stored, IST derived
-xauusd/price.py           all pip/point/volume/stop arithmetic; owns the pip definition
-xauusd/config/schema.py   fail-closed config; every safety value required, no defaults
-xauusd/db/store.py        connection factory; synchronous=FULL on the trading DB
-config/default.yaml.example   template; <<< FROM BROKER >>> marks what must be looked up
-tests/                    140 tests, incl. property tests over all three pip conventions
+xauusd/clock.py             the ONLY wall-clock reader; UTC stored, IST derived; iso_utc()
+xauusd/price.py             all pip/point/volume/stop arithmetic; owns the pip definition
+xauusd/config/schema.py     fail-closed config; every safety value required, no defaults
+xauusd/config/secrets.py    the ONLY reader of os.environ; redacts in __repr__
+xauusd/db/store.py          connection factory; synchronous=FULL on the trading DB
+xauusd/db/migrate.py        versioned migrations in PRAGMA user_version, transactional DDL
+xauusd/db/migrations/       archive/001_init.sql, trading/001_init.sql — all STRICT
+xauusd/archive/content.py   content_hash: normalisation + fingerprint (pure)
+xauusd/archive/ranges.py    coverage interval algebra (pure)
+xauusd/archive/media.py     admission policy + safe paths (pure)
+xauusd/archive/store.py     idempotent archive writes; no lock held across a network call
+xauusd/archive/fetcher.py   download verification, shared by backfill and the live listener
+xauusd/telegram/model.py    IncomingMessage, TelegramReader Protocol, FakeReader (pure)
+xauusd/telegram/backfill.py the history walk; drives the Protocol, no telethon
+xauusd/telegram/ingest.py   the ONLY telethon importer; conversion + live listener
+xauusd/notify/outbox.py     transactional outbox: priority, collapse keys, leases
+xauusd/run_archiver.py      entry point: check | backfill | live
+config/default.yaml.example template; <<< FROM BROKER >>> marks what must be looked up
+tools/resolve_chat_ids.py   operator script: resolve a chat_id, classify channel vs group
+tests/                      462 tests (477 with the telegram extra installed)
 ```
 
-Two conventions worth knowing before adding to this:
+Start with `python3 -m xauusd.run_archiver --config config/local.yaml check`. It needs no
+credentials and no network: it validates the config, migrates both databases, reports coverage,
+and does the pip-viability arithmetic against the daily loss limit — so a wrong `pip_size` is
+caught there rather than by every signal being rejected at runtime.
+
+Conventions worth knowing before adding to this:
 
 - **The unresolved pip value does not block writing code, only running it.** `PriceUtils` takes
   a `SymbolSpec` by injection and config requires `pip_size` with no default, so the module is
@@ -439,7 +601,29 @@ Two conventions worth knowing before adding to this:
   as a placeholder default.
 - **`tests/test_architecture.py` enforces the layer rules with `ast`,** not grep, so an aliased
   import cannot slip past. Rules for modules that do not exist yet are already written there and
-  skip until their module lands — add the rule when you plan the module, not after.
+  skip until their module lands — add the rule when you plan the module, not after. Live rules:
+  one wall-clock reader, one `os.environ` reader, one `isoformat` caller, one importer each of
+  `telethon` / `anthropic` / `MetaTrader5`, no I/O in the pure decision layers, and no import from
+  ingestion into `policy` / `risk` / `broker` / `execution`.
+- **Optional third-party imports go inside the function that needs them.** The `ast` lint still
+  sees them wherever the statement sits, but the module stays importable without the extra — which
+  is what keeps `test_every_module_is_importable` meaningful, and what will keep the package
+  importable on Linux once the Windows-only `MetaTrader5` arrives.
+- **`clock.iso_utc()` writes every stored timestamp.** Always UTC, always a literal `Z`, fixed
+  width, so lexicographic order is chronological and `BETWEEN` works on the text. Python's
+  `isoformat()` renders UTC as `+00:00`; a column holding both spellings breaks range comparisons
+  on the boundary silently. Every timestamp `CHECK` in the schema tests for the `Z`, and a lint
+  test forbids calling `isoformat` anywhere else. A dedupe window compared against SQLite's own
+  `datetime()` — which renders `2026-09-14 05:45:00`, space separator, no `Z`, no microseconds —
+  is wrong by hours and fails silently; compute cutoffs in Python.
+- **`executescript` commits any open transaction before it runs.** So a migration wrapped in
+  `write_transaction` is *not* atomic — the DDL commits and the outer COMMIT finds nothing. The
+  transaction has to live inside the script text, which is what `migrate.py` does and what its
+  rollback test pins.
+- **Never hold a SQLite write lock across a network call.** A download can block for seconds, and
+  the outbox is a writer too, so "we archived it" and "we told you" would go quiet together. The
+  archive flow is: one transaction to record and decide, no transaction to download, one short
+  transaction per result.
 
 > Note on history: commit `8a505a2` ("Update print statement from 'Hello' to 'Goodbye'") actually
 > overwrote `PAPER_AGENT_SPEC.md`, which previously held a different 968-line document —

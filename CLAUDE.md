@@ -64,6 +64,39 @@ trade count. If a change would relax one, **stop and raise it** rather than impl
   "signal rejected". Every decision must be reconstructible afterwards from the `decisions`
   table alone (spec §27).
 
+## Risk limits
+
+```text
+Account basis              $1,000
+daily_loss_limit           $50            (5% of starting-day equity)
+max_sl_pips                70             REJECT above — do not clamp, do not trade it
+min_rr                     1:1            measured entry → FINAL TP (see note)
+max_daily_trades_morning   3
+max_daily_trades_evening   1              (spec §7)
+max_sl_pips_evening        40             (spec §7, stricter than the morning cap)
+```
+
+`max_sl_pips = 70` comes from the observed signal source: it never posts more than 60–70 pips.
+A signal above 70 is **rejected**, never clamped to fit — clamping would silently change the
+trade the provider specified.
+
+**`min_rr` is measured against the final TP, not TP1.** Measured against TP1 it would reject
+most real signals: a 30-pip TP1 with a 60-pip SL is 0.5:1. Flagged because the choice is not
+obvious and it changes which signals survive.
+
+**Position sizing for this account: fixed minimum volume, not risk-percentage.** Four losses
+(3 morning + 1 evening) must fit inside `$50`, so per-trade risk must be `<= $12.50`. Risk-based
+sizing also has a known failure mode — a tighter SL buys a *larger* lot, so the worst-case trade
+is the one with the least room. At `0.01` lots a 70-pip SL risks about `$7` (pip = `$0.10`),
+which fits; `0.02` lots risks `$14`, which does not. This matches §34's "start with minimum
+practical position size".
+
+**The kill switch is an entry ban, not a loss cap (spec §21).** It stops new entries; §4 forbids
+force-closing, so an open position runs to its stop. Real worst case is therefore
+`daily_loss_limit + one full max_sl trade + gap slippage`. Trip the switch at
+`daily_loss_limit − max_open_risk` if it is to actually bind, and decide explicitly whether
+tripping flattens the open position.
+
 ## Trading rules
 
 ```text
@@ -76,12 +109,24 @@ Order rate limit           1 new ENTRY / 60s
 
 ```text
 New entries        05:30 – 09:00 IST
+Max new trades     3 per morning  (morning_trades)
+Max SL / risk      70 pips
 Outside window     NO NEW ENTRY — existing positions are still managed
 Session close      never force-closes a position unless a risk policy says so (spec §4)
 ```
 
 **Three consecutive losses** → morning new entries DISABLED. The losses must be consecutive; a
 winning trade resets the counter to 0.
+
+The 3-trade cap closes a real gap: spec §5 tracks `morning_trades` and **no rule in §1–§46 ever
+consumes it**. §7's cap of 1 is evening-only, so the morning window was uncapped — 210 minutes
+against a 60-second order limiter. A trade count is now the binding constraint alongside
+`daily_loss_limit`.
+
+> Note on the 3-loss reset: §8 says "a winning trade resets `consecutive_losses = 0`" with no
+> minimum size, so a +0.3 pip scratch resets the brake. Worth deciding whether a reset should
+> require a win above some threshold, or whether the rule should be `losses_today >= 3` rather
+> than *consecutive*. Not changed here — raising it, per invariant 10.
 
 ### Evening session
 
@@ -102,6 +147,11 @@ price, SL, TP, spread, risk and execution check.
 
 A "successful 70+ pip trade" is a *realized* winner with validated movement >= 70 pips.
 Touching +70 then losing does not count. Reaching TP1 alone does not count (spec §6).
+
+**The two wins are counted separately — 70 and 70, never summed.** The gate needs *two distinct
+trades*, each independently reaching >= 70 pips. One trade that moves 140 pips is **one**
+success, not two. Two trades of 35 pips each are **zero** successes, not one. Cumulative pips
+across trades are never added together for this gate.
 
 `end` has no invented default: an unbounded overnight session is the failure spec §4 warns
 against ("do not assume that after 8 PM means the bot can continuously trade all night"), so
@@ -125,6 +175,32 @@ lots: TP1 closes 1.00 (1.00 left) → TP2 closes 0.50 (0.50 left) → final TP c
 
 TP1 *distance* comes from the signal (30 / 35 / 60 / 75+ pips, market dependent) and is **not** a
 configured constant. The 170-pip threshold classifies the trade; it does not set any TP level.
+
+### Staged-exit eligibility — checked BEFORE entry
+
+The 170-pip threshold says what ladder the trade *wants*. This gate says whether a staged exit is
+physically **placeable**, and it is evaluated at approval time, not discovered at TP1:
+
+```text
+staged_exit_eligible  ⟺  TP1_distance >= spread_budget
+                                       + expected_slippage
+                                       + protective_buffer (15 pips)
+                                       + broker stops_level
+                                       + margin
+```
+
+If ineligible, the signal is a **single-exit trade by design**: full volume, broker-side SL and
+TP, no partial legs. Decided deterministically up front and logged as such.
+
+Why this exists: without it, any signal whose TP1 is closer than that sum degenerates to "close
+everything at TP1" *via a rejection cascade* — the protective SL is unplaceable, the fallback
+ladder below descends to rung 3, and the runner is closed. Systematically, invisibly, and logged
+as a fallback rather than as a decision. With TP1 as tight as 30 pips and gold spreads widening
+at rollover, this is the common case, not an edge case.
+
+Also assert at approval time that `TP1 < protective_SL_level` can never hold. If it does, either
+reject the signal or classify it single-exit — never enter a trade whose first target sits behind
+the stop it will move to.
 
 **Unresolved, ask before coding:**
 
@@ -256,10 +332,20 @@ consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
 
 ## Unresolved — ask, do not invent
 
-1. **XAUUSD pip definition.** Spec §13 forbids assuming `1 pip == 1 point`, then §6/§7/§14/§16
-   state every limit in pips without defining one. Depending on convention a pip is `$0.01`,
-   `$0.10` or `$1.00` — so "70 pips" spans `$0.70` to `$70`. **No threshold is codeable until
-   this comes from the broker's contract spec.** Do not pick a value.
+1. **XAUUSD pip definition — now decides whether the account size is viable at all.**
+   Spec §13 forbids assuming `1 pip == 1 point`, then §6/§7/§14/§16 state every limit in pips
+   without defining one. With the risk limits above, the consequence is no longer abstract.
+   XAUUSD contract size is 100 oz/lot, so `0.01` lots is 1 oz and a `$1` price move is `$1`:
+
+   | Convention | 70-pip SL at `0.01` lots | vs `$50` daily limit |
+   |---|---|---|
+   | pip = `$0.01` | `$0.70` | fine, but a 4-trade day risks `$2.80` — the limit never binds |
+   | pip = `$0.10` | `$7.00` | **works** — 4 losses = `$28`, inside the limit |
+   | pip = `$1.00` | `$70.00` | **140% of the daily limit on the smallest placeable trade** |
+
+   At `$1.00`/pip the bot must reject every trade, because the minimum volume already exceeds
+   the budget. That is "safe" and useless. **Get this from the broker's contract specification
+   before anything else.** Do not pick a value.
 2. **Deployment platform.** The official `MetaTrader5` Python package is **Windows only** (IPC to
    a running terminal; no Linux build). Unresolved between Windows VPS, a split MQL5-EA + Python
    design, or a broker REST API. Blocks P3, not P0.
@@ -273,6 +359,25 @@ consecutive validated signals, **and** >= 98% field-level accuracy on entry/SL.
    model's self-reported confidence would contradict §44. Current rule: confidence is *computed*
    — full agreement plus all deterministic validation passing = 1.0, any disagreement = 0.0. A
    graded score would have to come from measured per-field accuracy, never from the model.
+   Consequence to resolve: with a binary value, §38's `minimum_entry_confidence: 0.95` cannot
+   change behaviour, so it is a safety constant that provably does nothing. Either delete it and
+   restate §9 as "consensus + validation required", or build a graded score from measured
+   accuracy. Do not leave it as-is.
+6. **How 70 pips is measured *within* one trade.** The counting rule is settled (two separate
+   trades, never summed). The measurement inside a trade is not. Three readings disagree on the
+   normal case: volume-weighted exit distance, maximum favourable excursion plus a winning
+   close, or realized cash. Under the weighted reading a fully-won 30/100 two-TP trade realises
+   65 pips and **never counts**, which can make §7's evening gate unreachable. Recommended:
+   MFE-plus-winner — it matches "the trade moved 70 pips in my favour and I kept some of it",
+   and it is what §6's "temporarily reached +70 but subsequently loses does NOT count" is
+   carving out. It requires sampling ticks while a position is open. Store the raw inputs and a
+   `success_rule_version` so the rule can be re-evaluated over history.
+7. **Risk-increasing follow-up actions.** Current rule (below) permits them at `reply_to_id`
+   confidence 1.0. Recommendation on the table: **remove them from the action enum entirely**
+   for P0–P3, enforced by a lint test. A reply-to link proves a message is *about* a trade; it
+   does not prove the sender is authorised to increase risk, and anyone who can post in the
+   channel can reply to anything. Code that cannot widen an SL cannot be made to by a bug, a
+   misparse, injected screenshot text, or a compromised channel. Awaiting decision.
 
 ## Repository state
 
